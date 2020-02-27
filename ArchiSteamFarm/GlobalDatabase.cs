@@ -1,26 +1,23 @@
-﻿/*
-    _                _      _  ____   _                           _____
-   / \    _ __  ___ | |__  (_)/ ___| | |_  ___   __ _  _ __ ___  |  ___|__ _  _ __  _ __ ___
-  / _ \  | '__|/ __|| '_ \ | |\___ \ | __|/ _ \ / _` || '_ ` _ \ | |_  / _` || '__|| '_ ` _ \
- / ___ \ | |  | (__ | | | || | ___) || |_|  __/| (_| || | | | | ||  _|| (_| || |   | | | | | |
-/_/   \_\|_|   \___||_| |_||_||____/  \__|\___| \__,_||_| |_| |_||_|   \__,_||_|   |_| |_| |_|
-
- Copyright 2015-2017 Łukasz "JustArchi" Domeradzki
- Contact: JustArchi@JustArchi.net
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
- http://www.apache.org/licenses/LICENSE-2.0
-					
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-
-*/
+//     _                _      _  ____   _                           _____
+//    / \    _ __  ___ | |__  (_)/ ___| | |_  ___   __ _  _ __ ___  |  ___|__ _  _ __  _ __ ___
+//   / _ \  | '__|/ __|| '_ \ | |\___ \ | __|/ _ \ / _` || '_ ` _ \ | |_  / _` || '__|| '_ ` _ \
+//  / ___ \ | |  | (__ | | | || | ___) || |_|  __/| (_| || | | | | ||  _|| (_| || |   | | | | | |
+// /_/   \_\|_|   \___||_| |_||_||____/  \__|\___| \__,_||_| |_| |_||_|   \__,_||_|   |_| |_| |_|
+// |
+// Copyright 2015-2020 Łukasz "JustArchi" Domeradzki
+// Contact: JustArchi@JustArchi.net
+// |
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// |
+// http://www.apache.org/licenses/LICENSE-2.0
+// |
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 using System;
 using System.Collections.Concurrent;
@@ -29,58 +26,68 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using ArchiSteamFarm.Helpers;
+using ArchiSteamFarm.Localization;
+using ArchiSteamFarm.SteamKit2;
+using JetBrains.Annotations;
 using Newtonsoft.Json;
 
 namespace ArchiSteamFarm {
-	internal sealed class GlobalDatabase : IDisposable {
+	public sealed class GlobalDatabase : SerializableFile {
 		[JsonProperty(Required = Required.DisallowNull)]
-		internal readonly ConcurrentDictionary<uint, ConcurrentHashSet<uint>> AppIDsToPackageIDs = new ConcurrentDictionary<uint, ConcurrentHashSet<uint>>();
+		public readonly Guid Guid = Guid.NewGuid();
 
 		[JsonProperty(Required = Required.DisallowNull)]
-		internal readonly Guid Guid = Guid.NewGuid();
+		internal readonly ConcurrentDictionary<uint, (uint ChangeNumber, HashSet<uint> AppIDs)> PackagesData = new ConcurrentDictionary<uint, (uint ChangeNumber, HashSet<uint> AppIDs)>();
 
 		[JsonProperty(Required = Required.DisallowNull)]
 		internal readonly InMemoryServerListProvider ServerListProvider = new InMemoryServerListProvider();
 
-		private readonly object FileLock = new object();
-
 		private readonly SemaphoreSlim PackagesRefreshSemaphore = new SemaphoreSlim(1, 1);
 
 		internal uint CellID {
-			get => _CellID;
+			get => BackingCellID;
+
 			set {
-				if ((value == 0) || (_CellID == value)) {
+				if (BackingCellID == value) {
 					return;
 				}
 
-				_CellID = value;
-				Save();
+				BackingCellID = value;
+				Utilities.InBackground(Save);
 			}
 		}
 
-		[JsonProperty(Required = Required.DisallowNull)]
-		private uint _CellID;
+		[JsonProperty(PropertyName = "_CellID", Required = Required.DisallowNull)]
+		private uint BackingCellID;
 
-		private string FilePath;
-
-		// This constructor is used when creating new database
-		private GlobalDatabase(string filePath) : this() {
+		private GlobalDatabase([NotNull] string filePath) : this() {
 			if (string.IsNullOrEmpty(filePath)) {
 				throw new ArgumentNullException(nameof(filePath));
 			}
 
 			FilePath = filePath;
-			Save();
 		}
 
-		// This constructor is used only by deserializer
+		[JsonConstructor]
 		private GlobalDatabase() => ServerListProvider.ServerListUpdated += OnServerListUpdated;
 
-		public void Dispose() => ServerListProvider.ServerListUpdated -= OnServerListUpdated;
+		public override void Dispose() {
+			// Events we registered
+			ServerListProvider.ServerListUpdated -= OnServerListUpdated;
 
-		internal static GlobalDatabase Load(string filePath) {
+			// Those are objects that are always being created if constructor doesn't throw exception
+			PackagesRefreshSemaphore.Dispose();
+
+			// Base dispose
+			base.Dispose();
+		}
+
+		[ItemCanBeNull]
+		internal static async Task<GlobalDatabase> CreateOrLoad(string filePath) {
 			if (string.IsNullOrEmpty(filePath)) {
 				ASF.ArchiLogger.LogNullError(nameof(filePath));
+
 				return null;
 			}
 
@@ -91,81 +98,93 @@ namespace ArchiSteamFarm {
 			GlobalDatabase globalDatabase;
 
 			try {
-				globalDatabase = JsonConvert.DeserializeObject<GlobalDatabase>(File.ReadAllText(filePath));
+				string json = await RuntimeCompatibility.File.ReadAllTextAsync(filePath).ConfigureAwait(false);
+
+				if (string.IsNullOrEmpty(json)) {
+					ASF.ArchiLogger.LogGenericError(string.Format(Strings.ErrorIsEmpty, nameof(json)));
+
+					return null;
+				}
+
+				globalDatabase = JsonConvert.DeserializeObject<GlobalDatabase>(json);
 			} catch (Exception e) {
 				ASF.ArchiLogger.LogGenericException(e);
+
 				return null;
 			}
 
 			if (globalDatabase == null) {
 				ASF.ArchiLogger.LogNullError(nameof(globalDatabase));
+
 				return null;
 			}
 
 			globalDatabase.FilePath = filePath;
+
 			return globalDatabase;
 		}
 
-		internal async Task RefreshPackageIDs(Bot bot, ICollection<uint> packageIDs) {
-			if ((bot == null) || (packageIDs == null) || (packageIDs.Count == 0)) {
-				ASF.ArchiLogger.LogNullError(nameof(bot) + " || " + nameof(packageIDs));
+		internal HashSet<uint> GetPackageIDs(uint appID, ICollection<uint> packageIDs) {
+			if ((appID == 0) || (packageIDs == null) || (packageIDs.Count == 0)) {
+				ASF.ArchiLogger.LogNullError(nameof(appID) + " || " + nameof(packageIDs));
+
+				return null;
+			}
+
+			HashSet<uint> result = new HashSet<uint>();
+
+			foreach (uint packageID in packageIDs.Where(packageID => packageID != 0)) {
+				if (!PackagesData.TryGetValue(packageID, out (uint _, HashSet<uint> AppIDs) packagesData) || (packagesData.AppIDs?.Contains(appID) != true)) {
+					continue;
+				}
+
+				result.Add(packageID);
+			}
+
+			return result;
+		}
+
+		internal async Task RefreshPackages(Bot bot, IReadOnlyDictionary<uint, uint> packages) {
+			if ((bot == null) || (packages == null) || (packages.Count == 0)) {
+				ASF.ArchiLogger.LogNullError(nameof(bot) + " || " + nameof(packages));
+
 				return;
 			}
 
 			await PackagesRefreshSemaphore.WaitAsync().ConfigureAwait(false);
 
 			try {
-				HashSet<uint> missingPackageIDs = new HashSet<uint>(packageIDs.AsParallel().Where(packageID => AppIDsToPackageIDs.Values.All(packages => !packages.Contains(packageID))));
-				if (missingPackageIDs.Count == 0) {
+				HashSet<uint> packageIDs = packages.Where(package => (package.Key != 0) && (!PackagesData.TryGetValue(package.Key, out (uint ChangeNumber, HashSet<uint> _) packageData) || (packageData.ChangeNumber < package.Value))).Select(package => package.Key).ToHashSet();
+
+				if (packageIDs.Count == 0) {
 					return;
 				}
 
-				Dictionary<uint, HashSet<uint>> appIDsToPackageIDs = await bot.GetAppIDsToPackageIDs(missingPackageIDs);
-				if ((appIDsToPackageIDs == null) || (appIDsToPackageIDs.Count == 0)) {
+				Dictionary<uint, (uint ChangeNumber, HashSet<uint> AppIDs)> packagesData = await bot.GetPackagesData(packageIDs).ConfigureAwait(false);
+
+				if ((packagesData == null) || (packagesData.Count == 0)) {
+					bot.ArchiLogger.LogGenericWarning(Strings.WarningFailed);
+
 					return;
 				}
 
-				foreach (KeyValuePair<uint, HashSet<uint>> appIDtoPackageID in appIDsToPackageIDs) {
-					if (!AppIDsToPackageIDs.TryGetValue(appIDtoPackageID.Key, out ConcurrentHashSet<uint> packages)) {
-						packages = new ConcurrentHashSet<uint>();
-						AppIDsToPackageIDs[appIDtoPackageID.Key] = packages;
-					}
-
-					foreach (uint package in appIDtoPackageID.Value) {
-						packages.Add(package);
-					}
+				foreach ((uint packageID, (uint ChangeNumber, HashSet<uint> AppIDs) package) in packagesData) {
+					PackagesData[packageID] = package;
 				}
 
-				Save();
+				Utilities.InBackground(Save);
 			} finally {
 				PackagesRefreshSemaphore.Release();
 			}
 		}
 
-		private void OnServerListUpdated(object sender, EventArgs e) => Save();
+		private async void OnServerListUpdated(object sender, EventArgs e) => await Save().ConfigureAwait(false);
 
-		private void Save() {
-			string json = JsonConvert.SerializeObject(this);
-			if (string.IsNullOrEmpty(json)) {
-				ASF.ArchiLogger.LogNullError(nameof(json));
-				return;
-			}
+		// ReSharper disable UnusedMember.Global
+		public bool ShouldSerializeCellID() => CellID != 0;
+		public bool ShouldSerializePackagesData() => PackagesData.Count > 0;
+		public bool ShouldSerializeServerListProvider() => ServerListProvider.ShouldSerializeServerRecords();
 
-			lock (FileLock) {
-				string newFilePath = FilePath + ".new";
-
-				try {
-					File.WriteAllText(newFilePath, json);
-
-					if (File.Exists(FilePath)) {
-						File.Replace(newFilePath, FilePath, null);
-					} else {
-						File.Move(newFilePath, FilePath);
-					}
-				} catch (Exception e) {
-					ASF.ArchiLogger.LogGenericException(e);
-				}
-			}
-		}
+		// ReSharper restore UnusedMember.Global
 	}
 }
